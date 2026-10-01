@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/wyw14/cry-96/internal/gate"
 	"github.com/wyw14/cry-96/internal/journal"
 	"github.com/wyw14/cry-96/internal/model"
@@ -96,6 +97,27 @@ func (c *Controller) RampTo(ctx context.Context, cycle model.TransitCycle, targe
 	return c.ramp.Run(ctx, cycle, targets, c.IssueValve)
 }
 
+// RampDevice ramps one explicitly selected valve to a series of unsigned
+// openings in [0,1]; zero closes it. It lets the leveling module drive the
+// fill and drain valves independently.
+func (c *Controller) RampDevice(ctx context.Context, cycle model.TransitCycle, device model.DeviceKind, openings []float64) (RampResult, error) {
+	if device != model.DeviceFillValve && device != model.DeviceDrainValve {
+		return RampResult{}, errors.New("ramp target must be a fill or drain valve")
+	}
+	issue := func(ctx context.Context, cycleValue model.TransitCycle, opening float64) error {
+		if opening < 0 || opening > 1 {
+			return errors.New("valve opening must be within [0,1]")
+		}
+		command, err := c.commands.Issue(cycleValue, device, "set_opening", opening, c.now())
+		if err != nil {
+			return err
+		}
+		_, err = c.recorder.Record(ctx, cycleValue.ChamberID, model.EventCommandQueued, cycleValue.ID, cycleValue.Generation, command)
+		return err
+	}
+	return c.ramp.Run(ctx, cycle, openings, issue)
+}
+
 func (c *Controller) WindowSamples(chamberID string) []model.LevelSample {
 	c.mu.RLock()
 	window := c.windows[chamberID]
@@ -104,4 +126,36 @@ func (c *Controller) WindowSamples(chamberID string) []model.LevelSample {
 		return nil
 	}
 	return window.Samples()
+}
+
+// LatestSample returns the most recent chamber level observation together with
+// the cycle generation it belongs to.
+func (c *Controller) LatestSample(chamberID string) (model.LevelSample, bool) {
+	c.mu.RLock()
+	window := c.windows[chamberID]
+	c.mu.RUnlock()
+	if window == nil {
+		return model.LevelSample{}, false
+	}
+	samples := window.Samples()
+	if len(samples) == 0 {
+		return model.LevelSample{}, false
+	}
+	return samples[len(samples)-1], true
+}
+
+// ActiveGeneration reports which transit generation currently owns the
+// chamber's level window, so callers can reject stale leveling plans.
+func (c *Controller) ActiveGeneration(chamberID string) (uuid.UUID, uint64, bool) {
+	c.mu.RLock()
+	window := c.windows[chamberID]
+	c.mu.RUnlock()
+	if window == nil {
+		return uuid.Nil, 0, false
+	}
+	cycleID, generation := window.Identity()
+	if cycleID == uuid.Nil {
+		return uuid.Nil, 0, false
+	}
+	return cycleID, generation, true
 }
